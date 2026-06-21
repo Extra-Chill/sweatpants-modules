@@ -1,63 +1,88 @@
 """Mediavine Revenue Reports module for Sweatpants.
 
-Automates pulling per-period, per-URL revenue from the Mediavine reporting
-dashboard using sweatpants' pooled, proxied Playwright browser. Mediavine has
-NO reporting API (confirmed 2026-06-21) — the only data-out path is the
-dashboard itself (CSV export or the JSON its SPA frontend XHRs). That makes
-this a browser-automation problem, which is exactly what sweatpants is for.
+Pulls per-period, per-URL revenue from Mediavine using its REAL publisher API
+(reverse-engineered + tested 2026-06-21). This is pure HTTP — no browser, no
+Playwright. Every call goes out through sweatpants' rotating proxy via the core
+``proxied_request`` primitive.
 
 Architecture (chubes.net runs sweatpants — NOT EC prod):
 
     extrachill-analytics (EC prod) --signed job request--> sweatpants @ chubes.net
                                                             mediavine-reports module
-                                                            (Playwright -> reporting.mediavine.com)
+                                                            (HTTP -> api-publishers.mediavine.com)
                                    <--HMAC-signed callback (revenue rows)--+
 
-EC prod stays clean (no Playwright/scraper deps); chubes.net does the browser
-automation; results return via the proven signed-callback pattern.
+EC prod stays clean (no scraper deps); chubes.net does the API pull; results
+return via the proven signed-callback pattern.
 
-Depends on sweatpants#26: the signed-callback SENDER is now a core SDK
-primitive (`Module.send_signed_callback`) — this module does NOT hand-roll
-HMAC, it calls the shared primitive.
+Depends on sweatpants#26: the signed-callback SENDER is a core SDK primitive
+(``Module.send_signed_callback``) — this module does NOT hand-roll HMAC, it
+calls the shared primitive.
 
 ============================================================================
-FRAGILITY NOTICE — READ BEFORE TRUSTING THE NUMBERS
+THE REAL MEDIAVINE API (all endpoints tested 2026-06-21)
 ============================================================================
-Mediavine rebuilt its reporting dashboard in April 2026. The dashboard
-interaction — login selectors, the report URL, the date-range controls, and
-the export/XHR endpoint — is the FRAGILE part and is intentionally isolated in
-two methods: `_login()` and `_scrape_period()`. The selectors/endpoints below
-are marked `# TODO(confirm)` because they CANNOT be verified from this
-environment (no Mediavine credentials here). Before a real run, capture a
-manual session against the live dashboard (DevTools Network tab), confirm the
-exact selectors + the export/XHR endpoint, and fill them in. Do NOT trust a
-run until those TODOs are resolved against the live dashboard.
+1) LOGIN — POST https://api-publishers.mediavine.com/graphql
+   GraphQL mutation ``unidashSignIn`` with {email, password}. Returns
+   ``accessToken`` (Bearer), ``refreshToken``, ``expiresIn``, and a
+   ``twoFactorRequired`` flag. 2FA is not supported here — if the account
+   demands it we raise a clear error.
+
+2) PER-PAGE REVENUE CSV (report_type "pages", the primary pull) —
+   GET https://api-publishers.mediavine.com/reports/{SITE_ID}/pages.csv
+       ?startDate={MM/DD/YYYY}&endDate={MM/DD/YYYY}&perPage=100000&useMonetizable=false
+   Authorization: Bearer {accessToken}. Returns text/csv with columns
+   slug,views,revenue,rpm,cpm,viewability,fillRate,impressionsPerPageview.
+   Date format is MM/DD/YYYY (url-encoded by httpx).
+
+3) AGGREGATE METRICS (report_type "summary", optional) —
+   POST https://api-publishers.mediavine.com/graphql with Bearer auth.
+   ``metricsSummary`` query returns a single site-level row (earnings,
+   pageviews, sessions, cpm, sessionRpm, pageRpm, paidImpressions). NOTE this
+   one uses ISO timestamps, NOT MM/DD/YYYY.
 ============================================================================
 """
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import json
+from datetime import datetime
 from typing import Any, AsyncIterator, Optional
 
-from sweatpants import Module, get_browser
+from sweatpants import Module, proxied_request
 
 
-# Mediavine reporting surface (April-2026 rebuild). Hostnames are stable enough
-# to hardcode; the per-page selectors/endpoints below them are NOT and are
-# marked TODO(confirm).
-LOGIN_URL = "https://publisher-identity.mediavine.com/login"  # TODO(confirm) exact login route
-REPORTS_BASE_URL = "https://reporting.mediavine.com"  # TODO(confirm) reports app origin
+# Mediavine publisher API. These hosts/paths are the tested, stable surface.
+API_BASE = "https://api-publishers.mediavine.com"
+GRAPHQL_URL = f"{API_BASE}/graphql"
 
-# Per-request navigation timeout (ms). Dashboard SPA can be slow to hydrate.
-NAV_TIMEOUT_MS = 60_000
+# Default site identifier for Extra Chill — base64 of "InternalSite:11476".
+# Exposed as a module input so the same module serves other sites/accounts.
+DEFAULT_SITE_ID = "SW50ZXJuYWxTaXRlOjExNDc2"
+
+# Per-request timeout (seconds). A full-year pages.csv with perPage=100000 can
+# be a large payload, so give it generous headroom.
+REQUEST_TIMEOUT = 120.0
+
+# GraphQL login mutation (publisher dashboard sign-in).
+LOGIN_MUTATION = (
+    "mutation LoginFormMutation($data: UnidashSignInInput!) { "
+    "unidashSignIn(data: $data) { "
+    "accessToken expiresIn refreshToken tokenType twoFactorRequired userId } }"
+)
+
+# GraphQL aggregate-metrics query (site-level totals for report_type "summary").
+METRICS_SUMMARY_QUERY = (
+    "query MiniStatusTrackerQuery($data: MetricsSummaryInput!) { "
+    "metricsSummary(data: $data) { summary { "
+    "earnings pageviews sessions cpm sessionRpm pageRpm paidImpressions } } }"
+)
 
 
 class MediavineReports(Module):
-    """Pull per-period Mediavine revenue rows via Playwright and callback the result."""
+    """Pull per-period Mediavine revenue rows via the real HTTP API and callback the result."""
 
     async def run(
         self, inputs: dict[str, Any], settings: dict[str, Any]
@@ -66,14 +91,18 @@ class MediavineReports(Module):
 
         Args:
             inputs: periods | (period_start, period_end[, period]), report_type,
-                callback_url, callback_secret, callback_issuer, callback_user_id
+                site_id, callback_url, callback_secret, callback_issuer,
+                callback_user_id
             settings: mediavine_email, mediavine_password
         """
         report_type = inputs.get("report_type", "pages")
-        if report_type != "pages":
+        if report_type not in ("pages", "summary"):
             raise ValueError(
-                f"report_type {report_type!r} is not implemented; only 'pages' is supported"
+                f"report_type {report_type!r} is not supported; "
+                "use 'pages' (per-URL CSV) or 'summary' (site-level aggregate)"
             )
+
+        site_id = inputs.get("site_id") or DEFAULT_SITE_ID
 
         periods = self._normalize_periods(inputs)
         if not periods:
@@ -97,7 +126,8 @@ class MediavineReports(Module):
         completed = set(self.get_checkpoint("completed_periods", []) or [])
 
         await self.log(
-            f"Mediavine revenue pull: {len(periods)} period(s), report_type={report_type}"
+            f"Mediavine revenue pull: {len(periods)} period(s), "
+            f"report_type={report_type}, site_id={site_id}"
         )
         await self.save_checkpoint(
             stage="started",
@@ -105,61 +135,59 @@ class MediavineReports(Module):
             total_periods=len(periods),
         )
 
+        # Authenticate once for the whole job; the Bearer token is reused across
+        # every period request.
+        access_token = await self._login(email, password)
+
         collected: list[dict[str, Any]] = []
 
-        # use_proxy=True keeps us behind the pooled residential proxy. This is
-        # OUR OWN dashboard login to OUR OWN account — low frequency, ToS-mindful.
-        async with get_browser() as browser:
-            page = await browser.new_page()
-            page.set_default_timeout(NAV_TIMEOUT_MS)
+        for spec in periods:
+            label = spec["period"]
+            if label in completed:
+                await self.log(f"Skipping already-completed period: {label}")
+                continue
 
-            await self._login(page, email, password)
+            await self.log(
+                f"Pulling period {label} "
+                f"({spec['period_start']} → {spec['period_end']})"
+            )
 
-            for spec in periods:
-                label = spec["period"]
-                if label in completed:
-                    await self.log(f"Skipping already-completed period: {label}")
-                    continue
+            rows = await self._fetch_period(
+                access_token,
+                site_id=site_id,
+                report_type=report_type,
+                period_start=spec["period_start"],
+                period_end=spec["period_end"],
+            )
 
-                await self.log(
-                    f"Pulling period {label} "
-                    f"({spec['period_start']} → {spec['period_end']})"
-                )
+            # Tag every row with its period so the receiver can key on it.
+            for row in rows:
+                row["period"] = label
 
-                rows = await self._scrape_period(
-                    page,
-                    period_start=spec["period_start"],
-                    period_end=spec["period_end"],
-                )
+            period_result = {
+                "period": label,
+                "period_start": spec["period_start"],
+                "period_end": spec["period_end"],
+                "report_type": report_type,
+                "rows": rows,
+                "row_count": len(rows),
+            }
+            collected.append(period_result)
 
-                # Tag every row with its period so the receiver can key on it.
-                for row in rows:
-                    row["period"] = label
-
-                period_result = {
-                    "period": label,
-                    "period_start": spec["period_start"],
-                    "period_end": spec["period_end"],
-                    "report_type": report_type,
-                    "rows": rows,
-                    "row_count": len(rows),
-                }
-                collected.append(period_result)
-
-                # Yield incrementally so a multi-month pull surfaces progress and
-                # checkpoint so a restart resumes after the last completed period.
-                completed.add(label)
-                await self.save_checkpoint(
-                    stage="period_complete",
-                    completed_periods=sorted(completed),
-                    last_period=label,
-                )
-                yield {
-                    "status": "period_complete",
-                    "period": label,
-                    "row_count": len(rows),
-                    "rows": rows,
-                }
+            # Checkpoint so a restart resumes after the last completed period,
+            # and yield incrementally so a multi-month pull surfaces progress.
+            completed.add(label)
+            await self.save_checkpoint(
+                stage="period_complete",
+                completed_periods=sorted(completed),
+                last_period=label,
+            )
+            yield {
+                "status": "period_complete",
+                "period": label,
+                "row_count": len(rows),
+                "rows": rows,
+            }
 
         final_result = {
             "status": "complete",
@@ -219,126 +247,293 @@ class MediavineReports(Module):
         return []
 
     # -----------------------------------------------------------------
-    # Dashboard interaction — THE FRAGILE LAYER (isolated + swappable)
-    #
-    # Everything below talks to the live Mediavine dashboard. The selectors,
-    # the report URL, the date-range controls, and the export/XHR endpoint are
-    # the parts that break when Mediavine changes its UI. They are deliberately
-    # confined to `_login()` and `_scrape_period()` so the rest of the module
-    # (input handling, checkpointing, yielding, callback) is stable. To swap
-    # the scrape strategy (CSV export vs XHR JSON), edit `_scrape_period` only.
+    # Date conversion — the two Mediavine endpoints want different formats.
+    # pages.csv wants MM/DD/YYYY; metricsSummary wants an ISO timestamp.
+    # Inputs always arrive as YYYY-MM-DD.
     # -----------------------------------------------------------------
 
-    async def _login(self, page: Any, email: str, password: str) -> None:
-        """Log into the Mediavine reporting dashboard.
-
-        FRAGILE: selectors are unverified (no creds in this env). Confirm
-        against the live login page before trusting a run.
-        """
-        await self.log(f"Navigating to Mediavine login: {LOGIN_URL}")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        # TODO(confirm): exact selectors for the April-2026 login form. These
-        # are the conventional shapes; verify the real name/id/type attributes
-        # in DevTools before a production run.
-        try:
-            await page.fill('input[type="email"], input[name="email"]', email)
-            await page.fill('input[type="password"], input[name="password"]', password)
-            await page.click('button[type="submit"], button:has-text("Log in")')
-            # TODO(confirm): the post-login signal. Waiting for navigation away
-            # from the login origin is a safe default; a dashboard-specific
-            # selector (e.g. a nav avatar) would be more robust.
-            await page.wait_for_url(f"{REPORTS_BASE_URL}/**", timeout=NAV_TIMEOUT_MS)
-        except Exception as exc:
-            raise RuntimeError(
-                "Mediavine login flow failed — selectors likely changed. "
-                "Recapture the login form against the live dashboard and update "
-                f"_login(). Underlying error: {exc!r}"
-            ) from exc
-
-        await self.log("Mediavine login complete")
-
-    async def _scrape_period(
-        self, page: Any, period_start: str, period_end: str
-    ) -> list[dict[str, Any]]:
-        """Pull per-URL revenue rows for one date range.
-
-        FRAGILE: this is the single swappable strategy method. It currently
-        outlines the CSV-export path (preferred — the export is generally more
-        stable than scraping the SPA's internal XHR JSON). The exact report
-        URL, date-range controls, and export trigger/endpoint are unverified
-        (`# TODO(confirm)`) and MUST be captured against the live dashboard.
-
-        Returns a list of row dicts shaped for the extrachill-analytics revenue
-        import: {slug, views, revenue, rpm} (period is added by the caller).
-
-        Strategy choice: prefer triggering the dashboard's CSV export and
-        parsing the downloaded file (`_parse_revenue_csv`). Fall back to reading
-        the JSON the dashboard's own XHR returns only if the export proves less
-        stable. Whichever is wired up, keep it confined to THIS method.
-        """
-        # TODO(confirm): the pages-report URL and how the date range is passed.
-        # Many dashboards accept the range as query params; others require
-        # interacting with a date-picker widget. Capture the real flow first.
-        report_url = (
-            f"{REPORTS_BASE_URL}/reports/pages"
-            f"?start={period_start}&end={period_end}"
-        )  # TODO(confirm) exact path + param names
-
-        await self.log(f"Navigating to pages report: {report_url}")
-        await page.goto(report_url, wait_until="networkidle")
-
-        # ---- Preferred path: CSV export ----
-        # TODO(confirm): the export trigger (a button) and whether it produces
-        # a file download (Playwright `expect_download`) or an XHR that returns
-        # CSV/JSON inline. The block below is the download shape; adapt to the
-        # real control. Until confirmed, this raises so a run cannot silently
-        # produce empty/fabricated data.
-        try:
-            async with page.expect_download(timeout=NAV_TIMEOUT_MS) as dl_info:
-                # TODO(confirm): exact export button selector.
-                await page.click(
-                    'button:has-text("Export"), button:has-text("Download CSV")'
-                )
-            download = await dl_info.value
-            path = await download.path()
-            if path is None:
-                raise RuntimeError("export download produced no file")
-            with open(path, "r", encoding="utf-8") as fh:
-                csv_text = fh.read()
-            return self._parse_revenue_csv(csv_text)
-        except Exception as exc:
-            # Do NOT fabricate rows. Surface a clear, actionable failure so the
-            # fragile layer gets fixed rather than masked.
-            raise RuntimeError(
-                "Mediavine pages-report export failed — the dashboard interaction "
-                "(report URL, date-range control, or export trigger) is unverified "
-                "and must be confirmed against the live April-2026 dashboard via a "
-                "manual DevTools Network-tab capture. See the FRAGILITY NOTICE at "
-                f"the top of this module. Underlying error: {exc!r}"
-            ) from exc
+    @staticmethod
+    def _to_mmddyyyy(date_ymd: str) -> str:
+        """Convert a YYYY-MM-DD date to MM/DD/YYYY for the pages.csv endpoint."""
+        dt = datetime.strptime(date_ymd, "%Y-%m-%d")
+        return dt.strftime("%m/%d/%Y")
 
     @staticmethod
-    def _parse_revenue_csv(csv_text: str) -> list[dict[str, Any]]:
-        """Parse a Mediavine pages-report CSV into normalized revenue rows.
+    def _to_iso(date_ymd: str, *, end_of_day: bool = False) -> str:
+        """Convert a YYYY-MM-DD date to an ISO-8601 UTC timestamp.
 
-        Maps the export's columns onto the shape the extrachill-analytics
-        revenue import expects: {slug, views, revenue, rpm}. Unknown/extra
-        columns are ignored; missing numeric values default to 0.
+        metricsSummary uses ISO timestamps. The sample query used
+        ``2023-01-01T05:00:00.000Z`` (US-Eastern midnight expressed in UTC).
+        We anchor the day boundaries at UTC midnight, which is the safe,
+        unambiguous interpretation of a date-only input; ``end_of_day`` pushes
+        the end bound to the final millisecond so the whole day is inclusive.
+        """
+        dt = datetime.strptime(date_ymd, "%Y-%m-%d")
+        if end_of_day:
+            return dt.strftime("%Y-%m-%dT23:59:59.999Z")
+        return dt.strftime("%Y-%m-%dT00:00:00.000Z")
 
-        TODO(confirm): the EXACT export column headers. The header aliases
-        below are best-effort guesses — confirm against a real export and
-        prune/extend. Parsing logic is intentionally tolerant so a header
-        rename does not silently drop a column without being noticed in review.
+    # -----------------------------------------------------------------
+    # Mediavine HTTP API — login + per-period fetch
+    # -----------------------------------------------------------------
+
+    async def _login(self, email: str, password: str) -> str:
+        """Authenticate against the Mediavine publisher GraphQL API.
+
+        POSTs the ``unidashSignIn`` mutation and returns the Bearer access
+        token. Raises on 2FA-required accounts (not supported here) or any
+        non-success response.
+        """
+        await self.log("Authenticating with Mediavine publisher API")
+
+        body = {
+            "query": LOGIN_MUTATION,
+            "operationName": "LoginFormMutation",
+            "variables": {"data": {"email": email, "password": password}},
+        }
+
+        response = await proxied_request(
+            "POST",
+            GRAPHQL_URL,
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Mediavine login failed: HTTP {response.status_code} — "
+                f"{response.text[:500]!r}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Mediavine login returned non-JSON response: {response.text[:500]!r}"
+            ) from exc
+
+        # GraphQL transports errors in a top-level `errors` array even on HTTP 200.
+        if data.get("errors"):
+            raise RuntimeError(f"Mediavine login GraphQL errors: {data['errors']!r}")
+
+        sign_in = (data.get("data") or {}).get("unidashSignIn") or {}
+
+        if sign_in.get("twoFactorRequired"):
+            raise RuntimeError(
+                "Mediavine account requires two-factor authentication — the 2FA "
+                "login path is not supported by this module. Disable 2FA for the "
+                "reporting account or implement the 2FA flow."
+            )
+
+        access_token = sign_in.get("accessToken")
+        if not access_token:
+            raise RuntimeError(
+                "Mediavine login succeeded but no accessToken was returned: "
+                f"{sign_in!r}"
+            )
+
+        # refreshToken/expiresIn are returned too; not needed for a single
+        # short-lived job but captured in the checkpoint for future use.
+        await self.save_checkpoint(
+            stage="authenticated",
+            token_expires_in=sign_in.get("expiresIn"),
+        )
+        await self.log("Mediavine authentication complete")
+        return access_token
+
+    async def _fetch_period(
+        self,
+        access_token: str,
+        *,
+        site_id: str,
+        report_type: str,
+        period_start: str,
+        period_end: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch revenue rows for one date range.
+
+        For ``report_type == "pages"`` this GETs the per-URL pages.csv and parses
+        it into {slug, views, revenue, rpm, ...} rows. For
+        ``report_type == "summary"`` it POSTs the metricsSummary GraphQL query
+        and returns the single site-level aggregate row.
+
+        Returns row dicts; the caller tags each with its period label.
+        """
+        if report_type == "summary":
+            return await self._fetch_summary(
+                access_token,
+                site_id=site_id,
+                period_start=period_start,
+                period_end=period_end,
+            )
+        return await self._fetch_pages(
+            access_token,
+            site_id=site_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+    async def _fetch_pages(
+        self,
+        access_token: str,
+        *,
+        site_id: str,
+        period_start: str,
+        period_end: str,
+    ) -> list[dict[str, Any]]:
+        """GET the per-URL pages.csv report and parse it into revenue rows."""
+        url = f"{API_BASE}/reports/{site_id}/pages.csv"
+        params = {
+            "startDate": self._to_mmddyyyy(period_start),
+            "endDate": self._to_mmddyyyy(period_end),
+            "perPage": "100000",
+            "useMonetizable": "false",
+        }
+
+        await self.log(
+            f"GET pages.csv for {site_id} "
+            f"({params['startDate']} → {params['endDate']})"
+        )
+        response = await proxied_request(
+            "GET",
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Mediavine pages.csv request failed: HTTP {response.status_code} — "
+                f"{response.text[:500]!r}"
+            )
+
+        return self._parse_revenue_csv(response.text)
+
+    async def _fetch_summary(
+        self,
+        access_token: str,
+        *,
+        site_id: str,
+        period_start: str,
+        period_end: str,
+    ) -> list[dict[str, Any]]:
+        """POST the metricsSummary GraphQL query and return the aggregate row.
+
+        Returns a single-element list (one site-level aggregate row) so the
+        per-period plumbing in ``run`` is uniform with the CSV path.
+        """
+        body = {
+            "query": METRICS_SUMMARY_QUERY,
+            "operationName": "MiniStatusTrackerQuery",
+            "variables": {
+                "data": {
+                    "siteId": site_id,
+                    "startDate": self._to_iso(period_start),
+                    "endDate": self._to_iso(period_end, end_of_day=True),
+                }
+            },
+        }
+
+        await self.log(f"POST metricsSummary for {site_id}")
+        response = await proxied_request(
+            "POST",
+            GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Mediavine metricsSummary request failed: HTTP {response.status_code} — "
+                f"{response.text[:500]!r}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                "Mediavine metricsSummary returned non-JSON response: "
+                f"{response.text[:500]!r}"
+            ) from exc
+
+        if data.get("errors"):
+            raise RuntimeError(
+                f"Mediavine metricsSummary GraphQL errors: {data['errors']!r}"
+            )
+
+        summary = (
+            ((data.get("data") or {}).get("metricsSummary") or {}).get("summary")
+            or {}
+        )
+        if not summary:
+            await self.log(
+                "metricsSummary returned an empty summary for this period",
+                level="WARNING",
+            )
+            return []
+
+        # Normalize onto the same {slug, views, revenue, rpm} shape the revenue
+        # import expects, with the extra aggregate fields carried alongside. The
+        # synthetic slug marks this as a site-level total, not a per-URL row.
+        revenue = self._num(summary.get("earnings"))
+        views = int(self._num(summary.get("pageviews")))
+        row = {
+            "slug": "__site_total__",
+            "views": views,
+            "revenue": revenue,
+            "rpm": self._num(summary.get("pageRpm")),
+            "sessions": int(self._num(summary.get("sessions"))),
+            "cpm": self._num(summary.get("cpm")),
+            "session_rpm": self._num(summary.get("sessionRpm")),
+            "page_rpm": self._num(summary.get("pageRpm")),
+            "paid_impressions": int(self._num(summary.get("paidImpressions"))),
+        }
+        return [row]
+
+    @staticmethod
+    def _num(value: Any) -> float:
+        """Coerce a CSV/JSON value to float, tolerating $, commas, blanks, None."""
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        cleaned = str(value).replace("$", "").replace(",", "").strip()
+        if not cleaned:
+            return 0.0
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+
+    def _parse_revenue_csv(self, csv_text: str) -> list[dict[str, Any]]:
+        """Parse a Mediavine pages.csv response into normalized revenue rows.
+
+        The tested column set is:
+            slug,views,revenue,rpm,cpm,viewability,fillRate,impressionsPerPageview
+
+        Maps onto the shape the extrachill-analytics revenue import expects
+        ({slug, views, revenue, rpm}) and carries the remaining ad-quality
+        metrics alongside. Header lookup is case-insensitive and tolerant of
+        minor renames; rows without a slug are skipped.
         """
         rows: list[dict[str, Any]] = []
         reader = csv.DictReader(io.StringIO(csv_text))
 
-        # Candidate header aliases (lowercased). TODO(confirm) against a real export.
-        url_keys = ("url", "page", "page url", "slug", "path")
-        views_keys = ("views", "pageviews", "page views", "sessions", "impressions")
+        # Candidate header aliases (lowercased) per logical field.
+        slug_keys = ("slug", "url", "page", "page url", "path")
+        views_keys = ("views", "pageviews", "page views")
         revenue_keys = ("revenue", "earnings", "total revenue", "est. revenue")
         rpm_keys = ("rpm", "page rpm", "session rpm")
+        cpm_keys = ("cpm",)
+        viewability_keys = ("viewability",)
+        fill_rate_keys = ("fillrate", "fill rate")
+        ipp_keys = ("impressionsperpageview", "impressions per pageview")
 
         def _pick(record: dict[str, str], keys: tuple[str, ...]) -> Optional[str]:
             lowered = {(k or "").strip().lower(): v for k, v in record.items()}
@@ -347,25 +542,20 @@ class MediavineReports(Module):
                     return lowered[key]
             return None
 
-        def _num(value: Optional[str]) -> float:
-            if value is None:
-                return 0.0
-            cleaned = value.replace("$", "").replace(",", "").strip()
-            try:
-                return float(cleaned)
-            except ValueError:
-                return 0.0
-
         for record in reader:
-            slug = _pick(record, url_keys)
+            slug = _pick(record, slug_keys)
             if not slug:
                 continue
             rows.append(
                 {
                     "slug": slug.strip(),
-                    "views": int(_num(_pick(record, views_keys))),
-                    "revenue": _num(_pick(record, revenue_keys)),
-                    "rpm": _num(_pick(record, rpm_keys)),
+                    "views": int(self._num(_pick(record, views_keys))),
+                    "revenue": self._num(_pick(record, revenue_keys)),
+                    "rpm": self._num(_pick(record, rpm_keys)),
+                    "cpm": self._num(_pick(record, cpm_keys)),
+                    "viewability": self._num(_pick(record, viewability_keys)),
+                    "fill_rate": self._num(_pick(record, fill_rate_keys)),
+                    "impressions_per_pageview": self._num(_pick(record, ipp_keys)),
                 }
             )
 

@@ -2,7 +2,7 @@
   "id": "mediavine-reports",
   "name": "Mediavine Revenue Reports",
   "version": "0.1.0",
-  "description": "Automates per-period Mediavine revenue export via pooled, proxied Playwright. Logs into the Mediavine reporting dashboard, pulls per-URL revenue rows for each requested period, and POSTs them back to a receiver (e.g. extrachill-analytics) via an HMAC-signed callback.",
+  "description": "Pulls per-period Mediavine revenue via the real publisher HTTP API (GraphQL login + pages.csv + metricsSummary), all proxied. Authenticates with the Mediavine publisher API, pulls per-URL revenue rows (or site-level aggregates) for each requested period, and POSTs them back to a receiver (e.g. extrachill-analytics) via an HMAC-signed callback.",
   "entrypoint": "main.py",
   "inputs": [
     {
@@ -34,7 +34,14 @@
       "type": "text",
       "required": false,
       "default": "pages",
-      "description": "Which Mediavine report to pull. Currently only \"pages\" (per-URL revenue) is implemented."
+      "description": "Which Mediavine report to pull. \"pages\" (per-URL revenue CSV — the primary pull) or \"summary\" (site-level aggregate metrics via GraphQL, returning a single __site_total__ row per period)."
+    },
+    {
+      "id": "site_id",
+      "type": "text",
+      "required": false,
+      "default": "SW50ZXJuYWxTaXRlOjExNDc2",
+      "description": "Mediavine site identifier (base64 of \"InternalSite:<id>\"). Defaults to Extra Chill (SW50ZXJuYWxTaXRlOjExNDc2 = InternalSite:11476). Override to pull a different site under the same account."
     },
     {
       "id": "callback_url",
@@ -67,14 +74,14 @@
       "id": "mediavine_email",
       "type": "secret",
       "required": true,
-      "description": "Mediavine reporting dashboard login email. Stays on sweatpants — never sent to the WP side."
+      "description": "Mediavine publisher account login email. Stays on sweatpants — never sent to the WP side."
     },
     {
       "id": "mediavine_password",
       "type": "secret",
       "required": true,
-      "description": "Mediavine reporting dashboard login password. Stays on sweatpants — never sent to the WP side."
+      "description": "Mediavine publisher account login password. Stays on sweatpants — never sent to the WP side."
     }
   ],
-  "capabilities": ["browser"]
+  "capabilities": []
 }
