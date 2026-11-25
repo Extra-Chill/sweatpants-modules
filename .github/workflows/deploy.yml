@@ -1,0 +1,119 @@
+name: Deploy Sweatpants modules
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      modules:
+        description: 'Modules to deploy: all, or comma/whitespace-separated names'
+        type: string
+        default: all
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sweatpants-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check deployment credentials
+        shell: bash
+        env:
+          SWEATPANTS_API_AUTH_TOKEN: ${{ secrets.SWEATPANTS_API_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SWEATPANTS_API_AUTH_TOKEN" ]]; then
+            echo '::error::SWEATPANTS_API_AUTH_TOKEN is empty; configure the master token in the production environment.'
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test module detection
+        shell: bash
+        run: bash .github/scripts/test-changed-modules.sh
+
+      - name: Select modules
+        id: modules
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          REQUESTED_MODULES: ${{ inputs.modules }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            .github/scripts/changed-modules.sh --explicit "$REQUESTED_MODULES" > "$RUNNER_TEMP/deploy-modules"
+          else
+            .github/scripts/changed-modules.sh "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/deploy-modules"
+          fi
+          if [[ ! -s "$RUNNER_TEMP/deploy-modules" ]]; then
+            echo 'No changed modules to deploy.'
+            echo 'No changed modules to deploy.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'has_modules=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_modules=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy modules and reload
+        if: steps.modules.outputs.has_modules == 'true'
+        shell: bash
+        env:
+          SWEATPANTS_API_AUTH_TOKEN: ${{ secrets.SWEATPANTS_API_AUTH_TOKEN }}
+          SWEATPANTS_URL: ${{ vars.SWEATPANTS_URL || 'https://sweatpants.chubes.net' }}
+          REPO_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          base_url=${SWEATPANTS_URL%/}
+          failed=0
+          succeeded=0
+          {
+            echo '## Module deployment'
+            echo
+            echo '| Module / operation | Result |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r module; do
+            payload=$(jq -n --arg repo_url "$REPO_URL" --arg module_name "$module" \
+              '{repo_url: $repo_url, module_name: $module_name}')
+            # Do not print response bodies: servers may include sensitive details.
+            if curl --silent --show-error --fail-with-body --max-time 900 \
+              --request POST "$base_url/modules/install-git" \
+              --header "Authorization: Bearer $SWEATPANTS_API_AUTH_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data "$payload" --output "$RUNNER_TEMP/install-response"; then
+              echo "Installed $module"
+              printf '| `%s` | Passed |\n' "$module" >> "$GITHUB_STEP_SUMMARY"
+              succeeded=$((succeeded + 1))
+            else
+              echo "::error::Install failed for $module"
+              printf '| `%s` | Failed |\n' "$module" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done < "$RUNNER_TEMP/deploy-modules"
+
+          if (( succeeded > 0 )); then
+            if curl --silent --show-error --fail-with-body --max-time 900 \
+              --request POST "$base_url/modules/reload" \
+              --header "Authorization: Bearer $SWEATPANTS_API_AUTH_TOKEN" \
+              --output "$RUNNER_TEMP/reload-response"; then
+              echo '| Reload | Passed |' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo '::error::Module reload failed'
+              echo '| Reload | Failed |' >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          else
+            echo '| Reload | Skipped (no successful installs) |' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$failed"
